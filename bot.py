@@ -3,6 +3,9 @@ import logging
 import asyncio
 from datetime import datetime, timezone
 
+import json
+from pathlib import Path
+
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -19,10 +22,18 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s"
 )
 
+def load_settings():
+    p = Path("settings.json")
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {}
+
+_settings = load_settings()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SHEETS_WEBAPP_URL = os.getenv("SHEETS_WEBAPP_URL")
-SHEETS_SECRET = os.getenv("SHEETS_SECRET")
-WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Sheet1")
+SHEETS_WEBAPP_URL = os.getenv("SHEETS_WEBAPP_URL") or _settings.get("SHEETS_WEBAPP_URL")
+SHEETS_SECRET = os.getenv("SHEETS_SECRET") or _settings.get("SHEETS_SECRET")
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME") or _settings.get("WORKSHEET_NAME", "Sheet1")
 
 
 def build_keyboard() -> InlineKeyboardMarkup:
