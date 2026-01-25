@@ -3,9 +3,6 @@ import logging
 import asyncio
 from datetime import datetime, timezone
 
-import json
-from pathlib import Path
-
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -22,18 +19,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s"
 )
 
-def load_settings():
-    p = Path("settings.json")
-    if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
-    return {}
-
-_settings = load_settings()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SHEETS_WEBAPP_URL = os.getenv("SHEETS_WEBAPP_URL") or _settings.get("SHEETS_WEBAPP_URL")
-SHEETS_SECRET = os.getenv("SHEETS_SECRET") or _settings.get("SHEETS_SECRET")
-WORKSHEET_NAME = os.getenv("WORKSHEET_NAME") or _settings.get("WORKSHEET_NAME", "Sheet1")
+SHEETS_WEBAPP_URL = os.getenv("SHEETS_WEBAPP_URL")
+SHEETS_SECRET = os.getenv("SHEETS_SECRET")
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Sheet1")
 
 
 def build_keyboard() -> InlineKeyboardMarkup:
@@ -62,12 +51,20 @@ def send_score(user, score: int) -> None:
         "score": score,
     }
 
-    r = requests.post(SHEETS_WEBAPP_URL, json=payload, timeout=10)
+    r = requests.post(SHEETS_WEBAPP_URL, json=payload, timeout=15)
     r.raise_for_status()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Оцени покак: 1–10", reply_markup=build_keyboard())
+    await update.message.reply_text("Оцени: 1–10", reply_markup=build_keyboard())
+
+
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ok_url = bool(SHEETS_WEBAPP_URL)
+    ok_secret = bool(SHEETS_SECRET)
+    await update.message.reply_text(
+        f"SHEETS_WEBAPP_URL set: {ok_url}\nSHEETS_SECRET set: {ok_secret}\nWORKSHEET_NAME: {WORKSHEET_NAME}"
+    )
 
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -96,7 +93,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text(f"Записал: {score}/10 ✅")
             return
 
-    await update.message.reply_text("Пришли число от 1 до 10 или жми /start.")
+    await update.message.reply_text("Пришли число 1–10 или жми /start.")
 
 
 def main() -> None:
@@ -105,6 +102,7 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("debug", debug))
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
