@@ -38,13 +38,12 @@ def build_keyboard() -> InlineKeyboardMarkup:
 
 def send_score(user, score: int) -> None:
     if not SHEETS_WEBAPP_URL or not SHEETS_SECRET:
-        raise RuntimeError("Нет SHEETS_WEBAPP_URL или SHEETS_SECRET")
+        raise RuntimeError("Missing SHEETS_WEBAPP_URL or SHEETS_SECRET")
 
-    ts = datetime.now(timezone.utc).isoformat()
     payload = {
         "secret": SHEETS_SECRET,
         "sheetName": WORKSHEET_NAME,
-        "timestamp": ts,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "user_id": user.id,
         "username": user.username or "",
         "name": f"{user.first_name or ''} {user.last_name or ''}".strip(),
@@ -60,10 +59,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ok_url = bool(SHEETS_WEBAPP_URL)
-    ok_secret = bool(SHEETS_SECRET)
     await update.message.reply_text(
-        f"SHEETS_WEBAPP_URL set: {ok_url}\nSHEETS_SECRET set: {ok_secret}\nWORKSHEET_NAME: {WORKSHEET_NAME}"
+        "ENV status\n"
+        f"BOT_TOKEN set: {bool(BOT_TOKEN)}\n"
+        f"SHEETS_WEBAPP_URL set: {bool(SHEETS_WEBAPP_URL)}\n"
+        f"SHEETS_SECRET set: {bool(SHEETS_SECRET)}\n"
+        f"WORKSHEET_NAME: {WORKSHEET_NAME}"
     )
 
 
@@ -76,7 +77,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     score = int(data.split(":", 1)[1])
-    if score < 1 or score > 10:
+    if not (1 <= score <= 10):
         await query.edit_message_text("Оценка должна быть от 1 до 10.")
         return
 
@@ -98,7 +99,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 def main() -> None:
     if not BOT_TOKEN:
-        raise RuntimeError("Нет переменной окружения BOT_TOKEN")
+        raise RuntimeError("Missing BOT_TOKEN")
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
