@@ -51,6 +51,7 @@ def send_score(user, score: int) -> None:
     }
 
     r = requests.post(SHEETS_WEBAPP_URL, json=payload, timeout=15)
+    logging.info("Sheets status=%s body=%s", r.status_code, r.text[:200])
     r.raise_for_status()
 
 
