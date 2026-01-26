@@ -26,18 +26,23 @@ WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Sheet1")
 
 
 def keyboard_rate() -> InlineKeyboardMarkup:
+    # Сделаем кнопки чуть шире: 4 в ряд (вместо 5).
     rows = []
     row = []
     for i in range(1, 11):
         row.append(InlineKeyboardButton(str(i), callback_data=f"score:{i}"))
-        if i % 5 == 0:
+        if i % 4 == 0:
             rows.append(row)
             row = []
+    if row:
+        rows.append(row)
+
     rows.append([InlineKeyboardButton("Пукательная тревога", callback_data="anxiety")])
     return InlineKeyboardMarkup(rows)
 
 
 def keyboard_next() -> InlineKeyboardMarkup:
+    # Функционально это “оценить следующий покак”, но название кнопки как ты просил
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Оценить покак", callback_data="next")]
     ])
@@ -103,13 +108,14 @@ async def notify_others(context: ContextTypes.DEFAULT_TYPE, current_chat_id: int
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Регистрируем chat_id, чтобы уведомления работали
     def register():
         payload = user_payload(update.effective_user, update.effective_chat.id)
         payload.update({"event": "start"})
         return post_to_sheets(payload)
 
     await asyncio.to_thread(register)
-    await update.message.reply_text("Оцени покак", reply_markup=keyboard_rate())
+    await update.message.reply_text("Оцени покак:", reply_markup=keyboard_rate())
 
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -172,7 +178,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     current_chat_id = query.message.chat_id
 
     if data == "next":
-        await query.message.reply_text("Оцени покак", reply_markup=keyboard_rate())
+        await query.message.reply_text("Оцени покак:", reply_markup=keyboard_rate())
         return
 
     if data == "anxiety":
@@ -183,8 +189,9 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         res = await asyncio.to_thread(send)
         if res.get("ok"):
-            await query.edit_message_text("Записал: пукательная тревога")
-            await query.message.reply_text(reply_markup=keyboard_next())
+            await query.edit_message_text("Записал: пукательная тревога ✅")
+            # Отдельным сообщением отправляем кнопку (текст обязателен)
+            await query.message.reply_text("Оценить покак:", reply_markup=keyboard_next())
             await notify_others(context, current_chat_id, "Случилась пукательная тревога!")
         else:
             if res.get("error") == "network":
@@ -207,7 +214,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         res = await asyncio.to_thread(send)
         if res.get("ok"):
             await query.edit_message_text(f"Записал: {score}/10 ✅")
-            await query.message.reply_text(reply_markup=keyboard_next())
+            # Кнопка “следующий” отдельным сообщением
+            await query.message.reply_text("Оценить покак:", reply_markup=keyboard_next())
             await notify_others(context, current_chat_id, f"Кое-кто покакал! Оценка: {score}")
         else:
             if res.get("error") == "network":
