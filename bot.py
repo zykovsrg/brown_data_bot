@@ -53,9 +53,13 @@ def post_to_sheets(payload: dict) -> dict:
     }
     base.update(payload)
 
-    r = requests.post(SHEETS_WEBAPP_URL, json=base, timeout=20)
-    logging.info("Sheets status=%s body=%s", r.status_code, r.text[:200])
-    r.raise_for_status()
+    try:
+        r = requests.post(SHEETS_WEBAPP_URL, json=base, timeout=20)
+        logging.info("Sheets status=%s body=%s", r.status_code, r.text[:200])
+        r.raise_for_status()
+    except requests.RequestException as e:
+        logging.exception("Sheets request failed: %s", e)
+        return {"ok": False, "error": "network"}
 
     try:
         return r.json()
@@ -70,6 +74,7 @@ def user_payload(user) -> dict:
         "username": user.username or "",
         "name": f"{user.first_name or ''} {user.last_name or ''}".strip(),
     }
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Оцени покак", reply_markup=keyboard_rate())
@@ -92,7 +97,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     data = await asyncio.to_thread(fetch_stats)
 
     if not data.get("ok"):
-        await update.message.reply_text("Не смог получить статистику. Попробуй позже.")
+        if data.get("error") == "network":
+            await update.message.reply_text("Не могу достучаться до Google. Попробуй позже.")
+        else:
+            await update.message.reply_text("Не смог получить статистику. Попробуй позже.")
         return
 
     items = data.get("stats", [])
@@ -100,24 +108,26 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Пока нет данных.")
         return
 
-    lines = ["Статистика по людям:"]
+    lines = ["Статистика: средняя оценка"]
+
     for u in items:
         label = u.get("name") or (("@" + u.get("username")) if u.get("username") else u.get("user_id"))
-        cnt = u.get("score_count", 0)
-        avg = u.get("score_avg")
-        mn = u.get("score_min")
-        mx = u.get("score_max")
-        anx = u.get("anxiety_count", 0)
-        last = u.get("last_score")
 
-        avg_s = f"{avg:.2f}" if isinstance(avg, (int, float)) else "—"
-        last_s = f"{last}/10" if isinstance(last, (int, float)) else "—"
+        avg7 = u.get("avg_7d")
+        c7 = u.get("count_7d", 0)
+        a7 = u.get("anxiety_7d", 0)
+
+        avg30 = u.get("avg_30d")
+        c30 = u.get("count_30d", 0)
+        a30 = u.get("anxiety_30d", 0)
+
+        avg7_s = f"{avg7:.2f}" if isinstance(avg7, (int, float)) else "—"
+        avg30_s = f"{avg30:.2f}" if isinstance(avg30, (int, float)) else "—"
 
         lines.append(
             f"\n{label}\n"
-            f"Оценок: {cnt}, средняя: {avg_s}, мин: {mn or '—'}, макс: {mx or '—'}\n"
-            f"Пукательная тревога: {anx}\n"
-            f"Последняя оценка: {last_s}"
+            f"7 дней: средняя {avg7_s} (оценок {c7}), тревог {a7}\n"
+            f"30 дней: средняя {avg30_s} (оценок {c30}), тревог {a30}"
         )
 
     await update.message.reply_text("\n".join(lines))
@@ -143,7 +153,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.edit_message_text("Записал: пукательная тревога 🚨")
             await query.message.reply_text("Готово.", reply_markup=keyboard_next())
         else:
-            await query.edit_message_text("Не получилось записать. Попробуй ещё раз.")
+            if res.get("error") == "network":
+                await query.edit_message_text("Не могу достучаться до Google. Попробуй позже.")
+            else:
+                await query.edit_message_text("Не получилось записать. Попробуй ещё раз.")
         return
 
     if data.startswith("score:"):
@@ -162,7 +175,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.edit_message_text(f"Записал: {score}/10 ✅")
             await query.message.reply_text("Готово.", reply_markup=keyboard_next())
         else:
-            await query.edit_message_text("Не получилось записать. Попробуй ещё раз.")
+            if res.get("error") == "network":
+                await query.edit_message_text("Не могу достучаться до Google. Попробуй позже.")
+            else:
+                await query.edit_message_text("Не получилось записать. Попробуй ещё раз.")
         return
 
 
@@ -180,7 +196,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if res.get("ok"):
                 await update.message.reply_text(f"Записал: {score}/10 ✅", reply_markup=keyboard_next())
             else:
-                await update.message.reply_text("Не получилось записать. Попробуй ещё раз.")
+                if res.get("error") == "network":
+                    await update.message.reply_text("Не могу достучаться до Google. Попробуй позже.")
+                else:
+                    await update.message.reply_text("Не получилось записать. Попробуй ещё раз.")
             return
 
     await update.message.reply_text("Пришли число 1–10 или жми /start.")
