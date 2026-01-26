@@ -67,16 +67,50 @@ def post_to_sheets(payload: dict) -> dict:
         return {"ok": False, "error": "bad_json_response"}
 
 
-def user_payload(user) -> dict:
+def user_payload(user, chat_id: int) -> dict:
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "user_id": user.id,
         "username": user.username or "",
         "name": f"{user.first_name or ''} {user.last_name or ''}".strip(),
+        "chat_id": str(chat_id),
     }
 
 
+async def notify_others(context: ContextTypes.DEFAULT_TYPE, current_chat_id: int, text: str) -> None:
+    def fetch_chats():
+        return post_to_sheets({"action": "chats"})
+
+    data = await asyncio.to_thread(fetch_chats)
+    if not data.get("ok"):
+        logging.warning("Notify skipped: cannot fetch chats: %s", data)
+        return
+
+    chats = data.get("chats", [])
+    for chat_id_str in chats:
+        try:
+            chat_id = int(chat_id_str)
+        except Exception:
+            continue
+
+        if chat_id == current_chat_id:
+            continue
+
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        except Exception:
+            logging.exception("Failed to notify chat_id=%s", chat_id)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Регистрируем chat_id в таблице (тихо), чтобы уведомления работали
+    def register():
+        payload = user_payload(update.effective_user, update.effective_chat.id)
+        payload.update({"event": "start"})
+        return post_to_sheets(payload)
+
+    await asyncio.to_thread(register)
+
     await update.message.reply_text("Оцени покак", reply_markup=keyboard_rate())
 
 
@@ -137,6 +171,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     query = update.callback_query
     await query.answer()
     data = query.data or ""
+    current_chat_id = query.message.chat_id
 
     if data == "next":
         await query.message.reply_text("Оцени покак", reply_markup=keyboard_rate())
@@ -144,14 +179,15 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if data == "anxiety":
         def send():
-            payload = user_payload(query.from_user)
-            payload.update({"anxiety": True})
+            payload = user_payload(query.from_user, current_chat_id)
+            payload.update({"anxiety": True, "event": "anxiety"})
             return post_to_sheets(payload)
 
         res = await asyncio.to_thread(send)
         if res.get("ok"):
             await query.edit_message_text("Записал: пукательная тревога 🚨")
             await query.message.reply_text("Готово.", reply_markup=keyboard_next())
+            await notify_others(context, current_chat_id, "Случилась пукательная тревога!")
         else:
             if res.get("error") == "network":
                 await query.edit_message_text("Не могу достучаться до Google. Попробуй позже.")
@@ -166,14 +202,15 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
         def send():
-            payload = user_payload(query.from_user)
-            payload.update({"score": score})
+            payload = user_payload(query.from_user, current_chat_id)
+            payload.update({"score": score, "event": "score"})
             return post_to_sheets(payload)
 
         res = await asyncio.to_thread(send)
         if res.get("ok"):
             await query.edit_message_text(f"Записал: {score}/10 ✅")
             await query.message.reply_text("Готово.", reply_markup=keyboard_next())
+            await notify_others(context, current_chat_id, f"Кое-кто покакал! Оценка: {score}")
         else:
             if res.get("error") == "network":
                 await query.edit_message_text("Не могу достучаться до Google. Попробуй позже.")
@@ -184,17 +221,20 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
+    current_chat_id = update.effective_chat.id
+
     if text.isdigit():
         score = int(text)
         if 1 <= score <= 10:
             def send():
-                payload = user_payload(update.message.from_user)
-                payload.update({"score": score})
+                payload = user_payload(update.effective_user, current_chat_id)
+                payload.update({"score": score, "event": "score"})
                 return post_to_sheets(payload)
 
             res = await asyncio.to_thread(send)
             if res.get("ok"):
                 await update.message.reply_text(f"Записал: {score}/10 ✅", reply_markup=keyboard_next())
+                await notify_others(context, current_chat_id, f"Кое-кто покакал! Оценка: {score}")
             else:
                 if res.get("error") == "network":
                     await update.message.reply_text("Не могу достучаться до Google. Попробуй позже.")
