@@ -33,7 +33,7 @@ def keyboard_rate() -> InlineKeyboardMarkup:
         if i % 5 == 0:
             rows.append(row)
             row = []
-    rows.append([InlineKeyboardButton("🚨 Пукательная тревога", callback_data="anxiety")])
+    rows.append([InlineKeyboardButton("Пукательная тревога", callback_data="anxiety")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -103,14 +103,12 @@ async def notify_others(context: ContextTypes.DEFAULT_TYPE, current_chat_id: int
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Регистрируем chat_id в таблице (тихо), чтобы уведомления работали
     def register():
         payload = user_payload(update.effective_user, update.effective_chat.id)
         payload.update({"event": "start"})
         return post_to_sheets(payload)
 
     await asyncio.to_thread(register)
-
     await update.message.reply_text("Оцени покак", reply_markup=keyboard_rate())
 
 
@@ -185,8 +183,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         res = await asyncio.to_thread(send)
         if res.get("ok"):
-            await query.edit_message_text("Записал: пукательная тревога 🚨")
-            await query.message.reply_text("Готово.", reply_markup=keyboard_next())
+            await query.edit_message_text("Записал: пукательная тревога")
+            await query.message.reply_text(reply_markup=keyboard_next())
             await notify_others(context, current_chat_id, "Случилась пукательная тревога!")
         else:
             if res.get("error") == "network":
@@ -209,7 +207,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         res = await asyncio.to_thread(send)
         if res.get("ok"):
             await query.edit_message_text(f"Записал: {score}/10 ✅")
-            await query.message.reply_text("Готово.", reply_markup=keyboard_next())
+            await query.message.reply_text(reply_markup=keyboard_next())
             await notify_others(context, current_chat_id, f"Кое-кто покакал! Оценка: {score}")
         else:
             if res.get("error") == "network":
