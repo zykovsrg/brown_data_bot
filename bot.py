@@ -39,7 +39,7 @@ def keyboard_rate() -> InlineKeyboardMarkup:
 
 def keyboard_next() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Оценить следующий покак", callback_data="next")]
+        [InlineKeyboardButton("Оценить покак", callback_data="next")]
     ])
 
 
