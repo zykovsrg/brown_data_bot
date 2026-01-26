@@ -26,7 +26,6 @@ WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Sheet1")
 
 
 def keyboard_rate() -> InlineKeyboardMarkup:
-    # Сделаем кнопки чуть шире: 4 в ряд (вместо 5).
     rows = []
     row = []
     for i in range(1, 11):
@@ -42,7 +41,6 @@ def keyboard_rate() -> InlineKeyboardMarkup:
 
 
 def keyboard_next() -> InlineKeyboardMarkup:
-    # Функционально это “оценить следующий покак”, но название кнопки как ты просил
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Оценить покак", callback_data="next")]
     ])
@@ -108,7 +106,6 @@ async def notify_others(context: ContextTypes.DEFAULT_TYPE, current_chat_id: int
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Регистрируем chat_id, чтобы уведомления работали
     def register():
         payload = user_payload(update.effective_user, update.effective_chat.id)
         payload.update({"event": "start"})
@@ -146,10 +143,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Пока нет данных.")
         return
 
-    lines = ["Статистика: средняя оценка"]
+    parts = ["Статистика покаков за последнее время:"]
 
     for u in items:
-        label = u.get("name") or (("@" + u.get("username")) if u.get("username") else u.get("user_id"))
+        label = u.get("name") or (("@" + u.get("username")) if u.get("username") else str(u.get("user_id")))
 
         avg7 = u.get("avg_7d")
         c7 = u.get("count_7d", 0)
@@ -162,13 +159,19 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         avg7_s = f"{avg7:.2f}" if isinstance(avg7, (int, float)) else "—"
         avg30_s = f"{avg30:.2f}" if isinstance(avg30, (int, float)) else "—"
 
-        lines.append(
-            f"\n{label}\n"
-            f"7 дней: средняя {avg7_s} (оценок {c7}), тревог {a7}\n"
-            f"30 дней: средняя {avg30_s} (оценок {c30}), тревог {a30}"
+        parts.append(
+            f"\n{label}\n\n"
+            f"7 дней\n"
+            f"Средняя оценка: {avg7_s}\n"
+            f"Количество успешных покаков: {c7}\n"
+            f"Пукательных тревог: {a7}\n\n"
+            f"30 дней\n"
+            f"Средняя оценка: {avg30_s}\n"
+            f"Количество успешных покаков: {c30}\n"
+            f"Пукательных тревог: {a30}"
         )
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(parts))
 
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -190,7 +193,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         res = await asyncio.to_thread(send)
         if res.get("ok"):
             await query.edit_message_text("Записал: пукательная тревога ✅")
-            # Отдельным сообщением отправляем кнопку (текст обязателен)
             await query.message.reply_text("Оценить покак:", reply_markup=keyboard_next())
             await notify_others(context, current_chat_id, "Случилась пукательная тревога!")
         else:
@@ -214,7 +216,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         res = await asyncio.to_thread(send)
         if res.get("ok"):
             await query.edit_message_text(f"Записал: {score}/10 ✅")
-            # Кнопка “следующий” отдельным сообщением
             await query.message.reply_text("Оценить покак:", reply_markup=keyboard_next())
             await notify_others(context, current_chat_id, f"Кое-кто покакал! Оценка: {score}")
         else:
