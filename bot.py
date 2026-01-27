@@ -1,7 +1,8 @@
 import os
+import json
 import logging
 import asyncio
-from datetime import datetime, timezone, time, timedelta
+from datetime import datetime, timezone, time
 from zoneinfo import ZoneInfo
 import html
 
@@ -29,6 +30,11 @@ WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Sheet1")
 
 TZ = ZoneInfo("Europe/Moscow")
 ALARM_TEXT = "Привет! Коричневая тишина — это подозрительно. Не забудь добавить покаки!"
+
+DATA_DIR = "/app/data"
+QUEUE_PATH = os.path.join(DATA_DIR, "queue.jsonl")
+
+queue_lock = asyncio.Lock()
 
 
 # ---------- Keyboards ----------
@@ -69,7 +75,6 @@ def keyboard_react() -> InlineKeyboardMarkup:
 
 # ---------- Safe Telegram wrappers ----------
 async def _retry_sleep(attempt: int, base: float = 0.7) -> None:
-    # 0.7, 1.4, 2.8, 5.6
     await asyncio.sleep(base * (2 ** attempt))
 
 
@@ -89,15 +94,11 @@ async def safe_answer(query, text: str | None = None) -> None:
 
 
 async def safe_edit_or_send(query, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None) -> None:
-    """
-    Пытаемся edit_message_text. Если сеть упала или Telegram вернул ошибку — отправляем новое сообщение.
-    """
     for attempt in range(4):
         try:
             await query.edit_message_text(text, reply_markup=reply_markup)
             return
         except BadRequest as e:
-            # например: "Message is not modified"
             msg = str(e).lower()
             if "message is not modified" in msg:
                 return
@@ -112,7 +113,6 @@ async def safe_edit_or_send(query, context: ContextTypes.DEFAULT_TYPE, text: str
             logging.exception("edit_message_text failed: %s", e)
             break
 
-    # fallback: send new message
     try:
         await context.bot.send_message(chat_id=query.message.chat_id, text=text, reply_markup=reply_markup)
     except Exception as e:
@@ -175,15 +175,125 @@ def display_name(user) -> str:
     return str(user.id)
 
 
-async def register_chat(update: Update) -> None:
-    def register():
-        payload = user_payload(update.effective_user, update.effective_chat.id)
-        payload.update({"event": "start"})
-        return post_to_sheets(payload)
+# ---------- Queue ----------
+def ensure_data_dir() -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not os.path.exists(QUEUE_PATH):
+        with open(QUEUE_PATH, "a", encoding="utf-8"):
+            pass
 
-    await asyncio.to_thread(register)
+
+async def enqueue_event(event_payload: dict) -> None:
+    ensure_data_dir()
+    line = json.dumps(event_payload, ensure_ascii=False)
+    async with queue_lock:
+        await asyncio.to_thread(_append_line, QUEUE_PATH, line)
 
 
+def _append_line(path: str, line: str) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+async def queue_status() -> dict:
+    ensure_data_dir()
+    async with queue_lock:
+        lines = await asyncio.to_thread(_read_lines, QUEUE_PATH)
+
+    items = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            items.append(json.loads(ln))
+        except Exception:
+            continue
+
+    count = len(items)
+    oldest = None
+    if count:
+        oldest = items[0].get("timestamp")
+    return {"count": count, "oldest": oldest}
+
+
+def _read_lines(path: str) -> list[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.readlines()
+    except FileNotFoundError:
+        return []
+
+
+async def flush_queue_once() -> dict:
+    """
+    Пытается отправить очередь в Google.
+    Удаляет из файла только успешно отправленные.
+    Останавливается на первом сетевом фейле.
+    """
+    ensure_data_dir()
+
+    async with queue_lock:
+        lines = await asyncio.to_thread(_read_lines, QUEUE_PATH)
+
+        items = []
+        for ln in lines:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                items.append(json.loads(ln))
+            except Exception:
+                # битая строка — пропускаем
+                continue
+
+        if not items:
+            return {"ok": True, "sent": 0, "left": 0}
+
+        sent = 0
+        remaining = []
+
+        for payload in items:
+            res = await asyncio.to_thread(post_to_sheets, payload)
+            if res.get("ok"):
+                sent += 1
+                continue
+            # если сеть упала — оставляем это и всё после
+            remaining.append(payload)
+            remaining.extend(items[items.index(payload) + 1:])
+            break
+
+        # переписываем файл очереди
+        await asyncio.to_thread(_rewrite_queue, QUEUE_PATH, remaining)
+
+    return {"ok": True, "sent": sent, "left": len(remaining)}
+
+
+def _rewrite_queue(path: str, items: list[dict]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for it in items:
+            f.write(json.dumps(it, ensure_ascii=False) + "\n")
+
+
+async def send_or_queue(event_payload: dict) -> dict:
+    """
+    1) сначала пытаемся догнать старое
+    2) потом отправить текущее
+    3) если не получилось — кладём текущее в очередь
+    """
+    await flush_queue_once()
+
+    res = await asyncio.to_thread(post_to_sheets, event_payload)
+    if res.get("ok"):
+        # если получилось — на всякий случай ещё раз догоняем хвост
+        await flush_queue_once()
+        return {"ok": True, "queued": False}
+
+    await enqueue_event(event_payload)
+    return {"ok": False, "queued": True, "error": res.get("error")}
+
+
+# ---------- Sheets helpers ----------
 async def fetch_all_chats() -> list[str]:
     def f():
         return post_to_sheets({"action": "chats"})
@@ -228,7 +338,7 @@ async def notify_others(context: ContextTypes.DEFAULT_TYPE, current_chat_id: int
         await safe_send(context, chat_id, text)
 
 
-# ---------- Alarm (22:00 MSK) ----------
+# ---------- Jobs ----------
 async def alarm_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         recent = await has_recent_activity(24)
@@ -246,25 +356,30 @@ async def alarm_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logging.exception("alarm_job failed")
 
 
+async def flush_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        st = await flush_queue_once()
+        if st.get("sent"):
+            logging.info("Queue flushed: sent=%s left=%s", st.get("sent"), st.get("left"))
+    except Exception:
+        logging.exception("flush_job failed")
+
+
 # ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await register_chat(update)
     await update.message.reply_text("Оцени покак:", reply_markup=keyboard_rate())
 
 
 async def react(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await register_chat(update)
     await update.message.reply_text("Выбери реакцию:", reply_markup=keyboard_react())
 
 
 async def alarm_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await register_chat(update)
     ok = await set_alarm(update.effective_chat.id, True)
     await update.message.reply_text("Ок. Напоминания включены." if ok else "Не получилось включить. Попробуй позже.")
 
 
 async def alarm_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await register_chat(update)
     ok = await set_alarm(update.effective_chat.id, False)
     await update.message.reply_text("Ок. Напоминания выключены." if ok else "Не получилось выключить. Попробуй позже.")
 
@@ -279,6 +394,53 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Telegram ok?
+    telegram_ok = False
+    telegram_err = None
+    try:
+        await context.bot.get_me()
+        telegram_ok = True
+    except Exception as e:
+        telegram_err = str(e)
+
+    # Google ok? (пробуем лёгкий action=chats)
+    google_ok = False
+    google_err = None
+    try:
+        data = await asyncio.to_thread(post_to_sheets, {"action": "chats"})
+        google_ok = bool(data.get("ok"))
+        if not google_ok:
+            google_err = data.get("error") or "unknown"
+    except Exception as e:
+        google_err = str(e)
+
+    q = await queue_status()
+
+    msg = (
+        "health\n"
+        f"Telegram: {'ok' if telegram_ok else 'fail'}\n"
+        f"Google: {'ok' if google_ok else 'fail'}\n"
+        f"Queue: {q['count']} item(s)"
+    )
+    if not telegram_ok and telegram_err:
+        msg += f"\nTelegram err: {telegram_err[:120]}"
+    if not google_ok and google_err:
+        msg += f"\nGoogle err: {google_err[:120]}"
+    if q.get("oldest"):
+        msg += f"\nOldest: {q['oldest']}"
+
+    await update.message.reply_text(msg)
+
+
+async def queue_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = await queue_status()
+    msg = f"Очередь: {q['count']} item(s)"
+    if q.get("oldest"):
+        msg += f"\nСамое старое: {q['oldest']}"
+    await update.message.reply_text(msg)
+
+
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     def fetch_stats():
         return post_to_sheets({"action": "stats"})
@@ -287,8 +449,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not data.get("ok"):
         await update.message.reply_text(
-            "Не могу достучаться до Google. Попробуй позже." if data.get("error") == "network"
-            else "Не смог получить статистику. Попробуй позже."
+            "Не могу достучаться до Google. Попробуй позже."
         )
         return
 
@@ -370,22 +531,22 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if data == "anxiety":
-        def send():
-            payload = user_payload(query.from_user, current_chat_id)
-            payload.update({"anxiety": True, "event": "anxiety"})
-            return post_to_sheets(payload)
+        payload = user_payload(query.from_user, current_chat_id)
+        payload.update({"anxiety": True, "event": "anxiety"})
 
-        res = await asyncio.to_thread(send)
+        res = await send_or_queue(payload)
+
         if res.get("ok"):
             await safe_edit_or_send(query, context, "Записал: пукательная тревога ✅", reply_markup=keyboard_next())
-            await notify_others(context, current_chat_id, "Случилась пукательная тревога!")
         else:
             await safe_edit_or_send(
                 query,
                 context,
-                "Не могу достучаться до Google. Попробуй позже." if res.get("error") == "network"
-                else "Не получилось записать. Попробуй ещё раз."
+                "Записал: пукательная тревога ✅\nВ таблицу отправлю, когда появится связь.",
+                reply_markup=keyboard_next(),
             )
+
+        await notify_others(context, current_chat_id, "Случилась пукательная тревога!")
         return
 
     if data.startswith("score:"):
@@ -394,22 +555,22 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await safe_edit_or_send(query, context, "Оценка должна быть от 1 до 10.")
             return
 
-        def send():
-            payload = user_payload(query.from_user, current_chat_id)
-            payload.update({"score": score, "event": "score"})
-            return post_to_sheets(payload)
+        payload = user_payload(query.from_user, current_chat_id)
+        payload.update({"score": score, "event": "score"})
 
-        res = await asyncio.to_thread(send)
+        res = await send_or_queue(payload)
+
         if res.get("ok"):
             await safe_edit_or_send(query, context, f"Записал: {score}/10 ✅", reply_markup=keyboard_next())
-            await notify_others(context, current_chat_id, f"Кое-кто покакал! Оценка: {score}")
         else:
             await safe_edit_or_send(
                 query,
                 context,
-                "Не могу достучаться до Google. Попробуй позже." if res.get("error") == "network"
-                else "Не получилось записать. Попробуй ещё раз."
+                f"Записал: {score}/10 ✅\nВ таблицу отправлю, когда появится связь.",
+                reply_markup=keyboard_next(),
             )
+
+        await notify_others(context, current_chat_id, f"Кое-кто покакал! Оценка: {score}")
         return
 
 
@@ -420,20 +581,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if text.isdigit():
         score = int(text)
         if 1 <= score <= 10:
-            def send():
-                payload = user_payload(update.effective_user, current_chat_id)
-                payload.update({"score": score, "event": "score"})
-                return post_to_sheets(payload)
+            payload = user_payload(update.effective_user, current_chat_id)
+            payload.update({"score": score, "event": "score"})
 
-            res = await asyncio.to_thread(send)
+            res = await send_or_queue(payload)
+
             if res.get("ok"):
                 await update.message.reply_text(f"Записал: {score}/10 ✅", reply_markup=keyboard_next())
-                await notify_others(context, current_chat_id, f"Кое-кто покакал! Оценка: {score}")
             else:
                 await update.message.reply_text(
-                    "Не могу достучаться до Google. Попробуй позже." if res.get("error") == "network"
-                    else "Не получилось записать. Попробуй ещё раз."
+                    f"Записал: {score}/10 ✅\nВ таблицу отправлю, когда появится связь.",
+                    reply_markup=keyboard_next(),
                 )
+
+            await notify_others(context, current_chat_id, f"Кое-кто покакал! Оценка: {score}")
             return
 
     await update.message.reply_text("Пришли число 1–10 или жми /start.")
@@ -443,6 +604,8 @@ def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("Missing BOT_TOKEN")
 
+    ensure_data_dir()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -451,6 +614,8 @@ def main() -> None:
     app.add_handler(CommandHandler("alarm_on", alarm_on))
     app.add_handler(CommandHandler("alarm_off", alarm_off))
     app.add_handler(CommandHandler("debug", debug))
+    app.add_handler(CommandHandler("health", health))
+    app.add_handler(CommandHandler("queue_status", queue_status_cmd))
 
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
@@ -461,6 +626,13 @@ def main() -> None:
             alarm_job,
             time=time(hour=22, minute=0, tzinfo=TZ),
             name="daily_alarm_22_msk",
+        )
+        # догонялка очереди каждые 5 минут
+        app.job_queue.run_repeating(
+            flush_job,
+            interval=300,
+            first=30,
+            name="flush_queue_5min",
         )
     else:
         logging.warning("JobQueue is not available. Install python-telegram-bot[job-queue].")
