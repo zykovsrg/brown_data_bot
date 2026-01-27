@@ -1,7 +1,8 @@
 import os
 import logging
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 import html
 
 import requests
@@ -25,9 +26,11 @@ SHEETS_WEBAPP_URL = os.getenv("SHEETS_WEBAPP_URL")
 SHEETS_SECRET = os.getenv("SHEETS_SECRET")
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Sheet1")
 
+TZ = ZoneInfo("Europe/Moscow")
+ALARM_TEXT = "Привет! Коричневая тишина — это подозрительно. Не забудь добавить покаки!"
+
 
 def keyboard_rate() -> InlineKeyboardMarkup:
-    # 4 в ряд: обычно лучше влезает "10"
     rows = []
     row = []
     for i in range(1, 11):
@@ -45,6 +48,22 @@ def keyboard_rate() -> InlineKeyboardMarkup:
 def keyboard_next() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Оценить покак", callback_data="next")]
+    ])
+
+
+def keyboard_react() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💛 Радость", callback_data="react:joy"),
+            InlineKeyboardButton("🤍 Белая зависть", callback_data="react:white_envy"),
+        ],
+        [
+            InlineKeyboardButton("🖤 Чёрная зависть", callback_data="react:black_envy"),
+            InlineKeyboardButton("💜 Сочувствие", callback_data="react:empathy"),
+        ],
+        [
+            InlineKeyboardButton("💩 Злорадство", callback_data="react:schadenfreude"),
+        ],
     ])
 
 
@@ -79,32 +98,16 @@ def user_payload(user, chat_id: int) -> dict:
     }
 
 
-async def notify_others(context: ContextTypes.DEFAULT_TYPE, current_chat_id: int, text: str) -> None:
-    def fetch_chats():
-        return post_to_sheets({"action": "chats"})
-
-    data = await asyncio.to_thread(fetch_chats)
-    if not data.get("ok"):
-        logging.warning("Notify skipped: cannot fetch chats: %s", data)
-        return
-
-    for chat_id_str in data.get("chats", []):
-        try:
-            chat_id = int(chat_id_str)
-        except Exception:
-            continue
-
-        if chat_id == current_chat_id:
-            continue
-
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=text)
-        except Exception:
-            logging.exception("Failed to notify chat_id=%s", chat_id)
+def display_name(user) -> str:
+    name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+    if name:
+        return name
+    if user.username:
+        return f"@{user.username}"
+    return str(user.id)
 
 
 async def register_chat(update: Update) -> None:
-    # Регистрируем chat_id, чтобы уведомления работали
     def register():
         payload = user_payload(update.effective_user, update.effective_chat.id)
         payload.update({"event": "start"})
@@ -113,9 +116,105 @@ async def register_chat(update: Update) -> None:
     await asyncio.to_thread(register)
 
 
+async def fetch_all_chats() -> list[str]:
+    def f():
+        return post_to_sheets({"action": "chats"})
+    data = await asyncio.to_thread(f)
+    if not data.get("ok"):
+        return []
+    return data.get("chats", [])
+
+
+async def fetch_alarm_chats() -> list[str]:
+    def f():
+        return post_to_sheets({"action": "alarm_chats"})
+    data = await asyncio.to_thread(f)
+    if not data.get("ok"):
+        return []
+    return data.get("chats", [])
+
+
+async def set_alarm(chat_id: int, enabled: bool) -> bool:
+    def f():
+        return post_to_sheets({"action": "alarm_set", "chat_id": str(chat_id), "enabled": enabled})
+    data = await asyncio.to_thread(f)
+    return bool(data.get("ok"))
+
+
+async def has_recent_activity(hours: int = 24) -> bool:
+    def f():
+        return post_to_sheets({"action": "has_recent_activity", "hours": hours})
+    data = await asyncio.to_thread(f)
+    return bool(data.get("ok")) and bool(data.get("has_recent"))
+
+
+async def notify_others(context: ContextTypes.DEFAULT_TYPE, current_chat_id: int, text: str) -> None:
+    chats = await fetch_all_chats()
+    for chat_id_str in chats:
+        try:
+            chat_id = int(chat_id_str)
+        except Exception:
+            continue
+        if chat_id == current_chat_id:
+            continue
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        except Exception:
+            logging.exception("Failed to notify chat_id=%s", chat_id)
+
+
+async def alarm_loop(app: Application) -> None:
+    while True:
+        try:
+            now = datetime.now(TZ)
+            target = now.replace(hour=22, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target = target + timedelta(days=1)
+
+            await asyncio.sleep((target - now).total_seconds())
+
+            recent = await has_recent_activity(24)
+            if recent:
+                continue
+
+            chats = await fetch_alarm_chats()
+            for chat_id_str in chats:
+                try:
+                    chat_id = int(chat_id_str)
+                except Exception:
+                    continue
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text=ALARM_TEXT)
+                except Exception:
+                    logging.exception("Failed to send alarm to chat_id=%s", chat_id)
+
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logging.exception("Alarm loop error")
+            await asyncio.sleep(10)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await register_chat(update)
     await update.message.reply_text("Оцени покак:", reply_markup=keyboard_rate())
+
+
+async def react(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await register_chat(update)
+    await update.message.reply_text("Выбери реакцию:", reply_markup=keyboard_react())
+
+
+async def alarm_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await register_chat(update)
+    ok = await set_alarm(update.effective_chat.id, True)
+    await update.message.reply_text("Ок. Напоминания включены." if ok else "Не получилось включить. Попробуй позже.")
+
+
+async def alarm_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await register_chat(update)
+    ok = await set_alarm(update.effective_chat.id, False)
+    await update.message.reply_text("Ок. Напоминания выключены." if ok else "Не получилось выключить. Попробуй позже.")
 
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -135,10 +234,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     data = await asyncio.to_thread(fetch_stats)
 
     if not data.get("ok"):
-        if data.get("error") == "network":
-            await update.message.reply_text("Не могу достучаться до Google. Попробуй позже.")
-        else:
-            await update.message.reply_text("Не смог получить статистику. Попробуй позже.")
+        await update.message.reply_text("Не могу достучаться до Google. Попробуй позже." if data.get("error") == "network"
+                                        else "Не смог получить статистику. Попробуй позже.")
         return
 
     items = data.get("stats", [])
@@ -188,6 +285,35 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.edit_message_text("Оцени покак:", reply_markup=keyboard_rate())
         return
 
+    if data.startswith("react:"):
+        key = data.split(":", 1)[1]
+        name = display_name(query.from_user)
+
+        notify_map = {
+            "joy": f"Отлично покакано! {name} радуется!",
+            "white_envy": f"{name} завидует",
+            "black_envy": f"{name} завидует по-чёрному",
+            "empathy": f"{name} сочувствует!",
+            "schadenfreude": f"{name} считает, что это полностью заслуженно",
+        }
+        label_map = {
+            "joy": "💛 Радость",
+            "white_envy": "🤍 Белая зависть",
+            "black_envy": "🖤 Чёрная зависть",
+            "empathy": "💜 Сочувствие",
+            "schadenfreude": "💩 Злорадство",
+        }
+
+        text = notify_map.get(key)
+        label = label_map.get(key, "Реакция")
+        if not text:
+            await query.edit_message_text("Не понял реакцию. Попробуй ещё раз.")
+            return
+
+        await query.edit_message_text(f"Отправил реакцию: {label}")
+        await notify_others(context, current_chat_id, text)
+        return
+
     if data == "anxiety":
         def send():
             payload = user_payload(query.from_user, current_chat_id)
@@ -199,10 +325,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.edit_message_text("Записал: пукательная тревога ✅", reply_markup=keyboard_next())
             await notify_others(context, current_chat_id, "Случилась пукательная тревога!")
         else:
-            if res.get("error") == "network":
-                await query.edit_message_text("Не могу достучаться до Google. Попробуй позже.")
-            else:
-                await query.edit_message_text("Не получилось записать. Попробуй ещё раз.")
+            await query.edit_message_text("Не могу достучаться до Google. Попробуй позже." if res.get("error") == "network"
+                                          else "Не получилось записать. Попробуй ещё раз.")
         return
 
     if data.startswith("score:"):
@@ -221,10 +345,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.edit_message_text(f"Записал: {score}/10 ✅", reply_markup=keyboard_next())
             await notify_others(context, current_chat_id, f"Кое-кто покакал! Оценка: {score}")
         else:
-            if res.get("error") == "network":
-                await query.edit_message_text("Не могу достучаться до Google. Попробуй позже.")
-            else:
-                await query.edit_message_text("Не получилось записать. Попробуй ещё раз.")
+            await query.edit_message_text("Не могу достучаться до Google. Попробуй позже." if res.get("error") == "network"
+                                          else "Не получилось записать. Попробуй ещё раз.")
         return
 
 
@@ -245,10 +367,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await update.message.reply_text(f"Записал: {score}/10 ✅", reply_markup=keyboard_next())
                 await notify_others(context, current_chat_id, f"Кое-кто покакал! Оценка: {score}")
             else:
-                if res.get("error") == "network":
-                    await update.message.reply_text("Не могу достучаться до Google. Попробуй позже.")
-                else:
-                    await update.message.reply_text("Не получилось записать. Попробуй ещё раз.")
+                await update.message.reply_text("Не могу достучаться до Google. Попробуй позже." if res.get("error") == "network"
+                                                else "Не получилось записать. Попробуй ещё раз.")
             return
 
     await update.message.reply_text("Пришли число 1–10 или жми /start.")
@@ -259,11 +379,18 @@ def main() -> None:
         raise RuntimeError("Missing BOT_TOKEN")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("react", react))
+    app.add_handler(CommandHandler("alarm_on", alarm_on))
+    app.add_handler(CommandHandler("alarm_off", alarm_off))
     app.add_handler(CommandHandler("debug", debug))
+
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    app.create_task(alarm_loop(app))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
