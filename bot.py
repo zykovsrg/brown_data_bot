@@ -7,6 +7,7 @@ import html
 
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import NetworkError, TimedOut, RetryAfter, BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -30,6 +31,7 @@ TZ = ZoneInfo("Europe/Moscow")
 ALARM_TEXT = "Привет! Коричневая тишина — это подозрительно. Не забудь добавить покаки!"
 
 
+# ---------- Keyboards ----------
 def keyboard_rate() -> InlineKeyboardMarkup:
     rows = []
     row = []
@@ -46,9 +48,7 @@ def keyboard_rate() -> InlineKeyboardMarkup:
 
 
 def keyboard_next() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Оценить покак", callback_data="next")]
-    ])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Оценить покак", callback_data="next")]])
 
 
 def keyboard_react() -> InlineKeyboardMarkup:
@@ -67,6 +67,74 @@ def keyboard_react() -> InlineKeyboardMarkup:
     ])
 
 
+# ---------- Safe Telegram wrappers ----------
+async def _retry_sleep(attempt: int, base: float = 0.7) -> None:
+    # 0.7, 1.4, 2.8, 5.6
+    await asyncio.sleep(base * (2 ** attempt))
+
+
+async def safe_answer(query, text: str | None = None) -> None:
+    for attempt in range(4):
+        try:
+            await query.answer(text=text)
+            return
+        except RetryAfter as e:
+            await asyncio.sleep(float(getattr(e, "retry_after", 1.0)))
+        except (TimedOut, NetworkError) as e:
+            logging.warning("answerCallbackQuery network error: %s", e)
+            await _retry_sleep(attempt)
+        except Exception as e:
+            logging.exception("answerCallbackQuery failed: %s", e)
+            return
+
+
+async def safe_edit_or_send(query, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None) -> None:
+    """
+    Пытаемся edit_message_text. Если сеть упала или Telegram вернул ошибку — отправляем новое сообщение.
+    """
+    for attempt in range(4):
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup)
+            return
+        except BadRequest as e:
+            # например: "Message is not modified"
+            msg = str(e).lower()
+            if "message is not modified" in msg:
+                return
+            logging.warning("edit_message_text bad request: %s", e)
+            break
+        except RetryAfter as e:
+            await asyncio.sleep(float(getattr(e, "retry_after", 1.0)))
+        except (TimedOut, NetworkError) as e:
+            logging.warning("edit_message_text network error: %s", e)
+            await _retry_sleep(attempt)
+        except Exception as e:
+            logging.exception("edit_message_text failed: %s", e)
+            break
+
+    # fallback: send new message
+    try:
+        await context.bot.send_message(chat_id=query.message.chat_id, text=text, reply_markup=reply_markup)
+    except Exception as e:
+        logging.exception("fallback send_message failed: %s", e)
+
+
+async def safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
+    for attempt in range(4):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+            return
+        except RetryAfter as e:
+            await asyncio.sleep(float(getattr(e, "retry_after", 1.0)))
+        except (TimedOut, NetworkError) as e:
+            logging.warning("send_message network error: %s", e)
+            await _retry_sleep(attempt)
+        except Exception as e:
+            logging.exception("send_message failed: %s", e)
+            return
+
+
+# ---------- Sheets ----------
 def post_to_sheets(payload: dict) -> dict:
     if not SHEETS_WEBAPP_URL or not SHEETS_SECRET:
         raise RuntimeError("Missing SHEETS_WEBAPP_URL or SHEETS_SECRET")
@@ -76,7 +144,6 @@ def post_to_sheets(payload: dict) -> dict:
 
     try:
         r = requests.post(SHEETS_WEBAPP_URL, json=base, timeout=20)
-        # секреты/токены не логируем
         logging.info("Sheets status=%s body=%s", r.status_code, r.text[:200])
         r.raise_for_status()
     except requests.RequestException as e:
@@ -158,15 +225,11 @@ async def notify_others(context: ContextTypes.DEFAULT_TYPE, current_chat_id: int
             continue
         if chat_id == current_chat_id:
             continue
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=text)
-        except Exception:
-            logging.exception("Failed to notify chat_id=%s", chat_id)
+        await safe_send(context, chat_id, text)
 
 
-# ===== Alarm job (22:00 MSK) =====
+# ---------- Alarm (22:00 MSK) ----------
 async def alarm_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    # если за последние 24 часа нет оценок/тревог — шлём напоминание в чаты, где alarm_enabled=true
     try:
         recent = await has_recent_activity(24)
         if recent:
@@ -178,14 +241,12 @@ async def alarm_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id = int(chat_id_str)
             except Exception:
                 continue
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=ALARM_TEXT)
-            except Exception:
-                logging.exception("Failed to send alarm to chat_id=%s", chat_id)
+            await safe_send(context, chat_id, ALARM_TEXT)
     except Exception:
         logging.exception("alarm_job failed")
 
 
+# ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await register_chat(update)
     await update.message.reply_text("Оцени покак:", reply_markup=keyboard_rate())
@@ -268,14 +329,15 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(parts), parse_mode="HTML")
 
 
+# ---------- Callback buttons ----------
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
     data = query.data or ""
     current_chat_id = query.message.chat_id
 
     if data == "next":
-        await query.edit_message_text("Оцени покак:", reply_markup=keyboard_rate())
+        await safe_edit_or_send(query, context, "Оцени покак:", reply_markup=keyboard_rate())
         return
 
     if data.startswith("react:"):
@@ -300,10 +362,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         text = notify_map.get(key)
         label = label_map.get(key, "Реакция")
         if not text:
-            await query.edit_message_text("Не понял реакцию. Попробуй ещё раз.")
+            await safe_edit_or_send(query, context, "Не понял реакцию. Попробуй ещё раз.")
             return
 
-        await query.edit_message_text(f"Отправил реакцию: {label}")
+        await safe_edit_or_send(query, context, f"Отправил реакцию: {label}")
         await notify_others(context, current_chat_id, text)
         return
 
@@ -315,10 +377,12 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         res = await asyncio.to_thread(send)
         if res.get("ok"):
-            await query.edit_message_text("Записал: пукательная тревога ✅", reply_markup=keyboard_next())
+            await safe_edit_or_send(query, context, "Записал: пукательная тревога ✅", reply_markup=keyboard_next())
             await notify_others(context, current_chat_id, "Случилась пукательная тревога!")
         else:
-            await query.edit_message_text(
+            await safe_edit_or_send(
+                query,
+                context,
                 "Не могу достучаться до Google. Попробуй позже." if res.get("error") == "network"
                 else "Не получилось записать. Попробуй ещё раз."
             )
@@ -327,7 +391,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if data.startswith("score:"):
         score = int(data.split(":", 1)[1])
         if not (1 <= score <= 10):
-            await query.edit_message_text("Оценка должна быть от 1 до 10.")
+            await safe_edit_or_send(query, context, "Оценка должна быть от 1 до 10.")
             return
 
         def send():
@@ -337,10 +401,12 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         res = await asyncio.to_thread(send)
         if res.get("ok"):
-            await query.edit_message_text(f"Записал: {score}/10 ✅", reply_markup=keyboard_next())
+            await safe_edit_or_send(query, context, f"Записал: {score}/10 ✅", reply_markup=keyboard_next())
             await notify_others(context, current_chat_id, f"Кое-кто покакал! Оценка: {score}")
         else:
-            await query.edit_message_text(
+            await safe_edit_or_send(
+                query,
+                context,
                 "Не могу достучаться до Google. Попробуй позже." if res.get("error") == "network"
                 else "Не получилось записать. Попробуй ещё раз."
             )
