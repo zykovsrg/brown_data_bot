@@ -5,7 +5,12 @@ from datetime import datetime, timezone
 import html
 
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -24,6 +29,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEETS_WEBAPP_URL = os.getenv("SHEETS_WEBAPP_URL")
 SHEETS_SECRET = os.getenv("SHEETS_SECRET")
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Sheet1")
+
+BTN_RATE = "Оценить покак"
+BTN_STATS = "Узнать статистику"
+
+
+def main_menu() -> ReplyKeyboardMarkup:
+    # Постоянное меню снизу чата
+    return ReplyKeyboardMarkup(
+        [[BTN_RATE, BTN_STATS]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Выбери действие",
+    )
 
 
 def keyboard_rate() -> InlineKeyboardMarkup:
@@ -103,14 +121,29 @@ async def notify_others(context: ContextTypes.DEFAULT_TYPE, current_chat_id: int
             logging.exception("Failed to notify chat_id=%s", chat_id)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def register_chat(update: Update) -> None:
+    # Регистрируем chat_id, чтобы уведомления работали
     def register():
         payload = user_payload(update.effective_user, update.effective_chat.id)
         payload.update({"event": "start"})
         return post_to_sheets(payload)
 
     await asyncio.to_thread(register)
-    await update.message.reply_text("Оцени покак:", reply_markup=keyboard_rate())
+
+
+async def send_rate_prompt(chat, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Сообщение с инлайн-кнопками оценок
+    await context.bot.send_message(chat_id=chat.id, text="Оцени покак:", reply_markup=keyboard_rate())
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await register_chat(update)
+    # Сначала показываем меню, дальше пользователь жмёт “Оценить покак”
+    await update.message.reply_text("Меню:", reply_markup=main_menu())
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Меню:", reply_markup=main_menu())
 
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -180,7 +213,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     current_chat_id = query.message.chat_id
 
     if data == "next":
-        # Превращаем текущее сообщение обратно в “оценку”, без нового сообщения
         await query.edit_message_text("Оцени покак:", reply_markup=keyboard_rate())
         return
 
@@ -226,11 +258,23 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
-    current_chat_id = update.effective_chat.id
 
+    # Меню-кнопки
+    if text == BTN_RATE:
+        await register_chat(update)
+        await send_rate_prompt(update.effective_chat, context)
+        return
+
+    if text == BTN_STATS:
+        await stats(update, context)
+        return
+
+    # Число 1–10 как быстрый ввод
     if text.isdigit():
         score = int(text)
         if 1 <= score <= 10:
+            current_chat_id = update.effective_chat.id
+
             def send():
                 payload = user_payload(update.effective_user, current_chat_id)
                 payload.update({"score": score, "event": "score"})
@@ -247,7 +291,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     await update.message.reply_text("Не получилось записать. Попробуй ещё раз.")
             return
 
-    await update.message.reply_text("Пришли число 1–10 или жми /start.")
+    await update.message.reply_text("Выбери пункт меню или пришли число 1–10.")
 
 
 def main() -> None:
@@ -256,7 +300,8 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("stats", stats))   # на всякий случай
     app.add_handler(CommandHandler("debug", debug))
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
