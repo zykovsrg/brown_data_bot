@@ -1,7 +1,7 @@
 import os
 import logging
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, time, timedelta
 from zoneinfo import ZoneInfo
 import html
 
@@ -76,6 +76,7 @@ def post_to_sheets(payload: dict) -> dict:
 
     try:
         r = requests.post(SHEETS_WEBAPP_URL, json=base, timeout=20)
+        # секреты/токены не логируем
         logging.info("Sheets status=%s body=%s", r.status_code, r.text[:200])
         r.raise_for_status()
     except requests.RequestException as e:
@@ -163,36 +164,26 @@ async def notify_others(context: ContextTypes.DEFAULT_TYPE, current_chat_id: int
             logging.exception("Failed to notify chat_id=%s", chat_id)
 
 
-async def alarm_loop(app: Application) -> None:
-    while True:
-        try:
-            now = datetime.now(TZ)
-            target = now.replace(hour=22, minute=0, second=0, microsecond=0)
-            if now >= target:
-                target = target + timedelta(days=1)
-
-            await asyncio.sleep((target - now).total_seconds())
-
-            recent = await has_recent_activity(24)
-            if recent:
-                continue
-
-            chats = await fetch_alarm_chats()
-            for chat_id_str in chats:
-                try:
-                    chat_id = int(chat_id_str)
-                except Exception:
-                    continue
-                try:
-                    await app.bot.send_message(chat_id=chat_id, text=ALARM_TEXT)
-                except Exception:
-                    logging.exception("Failed to send alarm to chat_id=%s", chat_id)
-
-        except asyncio.CancelledError:
+# ===== Alarm job (22:00 MSK) =====
+async def alarm_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # если за последние 24 часа нет оценок/тревог — шлём напоминание в чаты, где alarm_enabled=true
+    try:
+        recent = await has_recent_activity(24)
+        if recent:
             return
-        except Exception:
-            logging.exception("Alarm loop error")
-            await asyncio.sleep(10)
+
+        chats = await fetch_alarm_chats()
+        for chat_id_str in chats:
+            try:
+                chat_id = int(chat_id_str)
+            except Exception:
+                continue
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=ALARM_TEXT)
+            except Exception:
+                logging.exception("Failed to send alarm to chat_id=%s", chat_id)
+    except Exception:
+        logging.exception("alarm_job failed")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -234,8 +225,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     data = await asyncio.to_thread(fetch_stats)
 
     if not data.get("ok"):
-        await update.message.reply_text("Не могу достучаться до Google. Попробуй позже." if data.get("error") == "network"
-                                        else "Не смог получить статистику. Попробуй позже.")
+        await update.message.reply_text(
+            "Не могу достучаться до Google. Попробуй позже." if data.get("error") == "network"
+            else "Не смог получить статистику. Попробуй позже."
+        )
         return
 
     items = data.get("stats", [])
@@ -325,8 +318,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.edit_message_text("Записал: пукательная тревога ✅", reply_markup=keyboard_next())
             await notify_others(context, current_chat_id, "Случилась пукательная тревога!")
         else:
-            await query.edit_message_text("Не могу достучаться до Google. Попробуй позже." if res.get("error") == "network"
-                                          else "Не получилось записать. Попробуй ещё раз.")
+            await query.edit_message_text(
+                "Не могу достучаться до Google. Попробуй позже." if res.get("error") == "network"
+                else "Не получилось записать. Попробуй ещё раз."
+            )
         return
 
     if data.startswith("score:"):
@@ -345,8 +340,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.edit_message_text(f"Записал: {score}/10 ✅", reply_markup=keyboard_next())
             await notify_others(context, current_chat_id, f"Кое-кто покакал! Оценка: {score}")
         else:
-            await query.edit_message_text("Не могу достучаться до Google. Попробуй позже." if res.get("error") == "network"
-                                          else "Не получилось записать. Попробуй ещё раз.")
+            await query.edit_message_text(
+                "Не могу достучаться до Google. Попробуй позже." if res.get("error") == "network"
+                else "Не получилось записать. Попробуй ещё раз."
+            )
         return
 
 
@@ -367,8 +364,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await update.message.reply_text(f"Записал: {score}/10 ✅", reply_markup=keyboard_next())
                 await notify_others(context, current_chat_id, f"Кое-кто покакал! Оценка: {score}")
             else:
-                await update.message.reply_text("Не могу достучаться до Google. Попробуй позже." if res.get("error") == "network"
-                                                else "Не получилось записать. Попробуй ещё раз.")
+                await update.message.reply_text(
+                    "Не могу достучаться до Google. Попробуй позже." if res.get("error") == "network"
+                    else "Не получилось записать. Попробуй ещё раз."
+                )
             return
 
     await update.message.reply_text("Пришли число 1–10 или жми /start.")
@@ -390,7 +389,16 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    app.create_task(alarm_loop(app))
+    # ежедневное напоминание в 22:00 по Москве
+    if app.job_queue:
+        app.job_queue.run_daily(
+            alarm_job,
+            time=time(hour=22, minute=0, tzinfo=TZ),
+            name="daily_alarm_22_msk",
+        )
+    else:
+        logging.warning("JobQueue is not available. Install python-telegram-bot[job-queue].")
+
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
