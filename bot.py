@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 from datetime import datetime, timezone
+import html
 
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -26,6 +27,7 @@ WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Sheet1")
 
 
 def keyboard_rate() -> InlineKeyboardMarkup:
+    # 4 в ряд: обычно лучше влезает "10"
     rows = []
     row = []
     for i in range(1, 11):
@@ -50,10 +52,7 @@ def post_to_sheets(payload: dict) -> dict:
     if not SHEETS_WEBAPP_URL or not SHEETS_SECRET:
         raise RuntimeError("Missing SHEETS_WEBAPP_URL or SHEETS_SECRET")
 
-    base = {
-        "secret": SHEETS_SECRET,
-        "sheetName": WORKSHEET_NAME,
-    }
+    base = {"secret": SHEETS_SECRET, "sheetName": WORKSHEET_NAME}
     base.update(payload)
 
     try:
@@ -89,8 +88,7 @@ async def notify_others(context: ContextTypes.DEFAULT_TYPE, current_chat_id: int
         logging.warning("Notify skipped: cannot fetch chats: %s", data)
         return
 
-    chats = data.get("chats", [])
-    for chat_id_str in chats:
+    for chat_id_str in data.get("chats", []):
         try:
             chat_id = int(chat_id_str)
         except Exception:
@@ -146,7 +144,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     parts = ["Статистика покаков за последнее время:"]
 
     for u in items:
-        label = u.get("name") or (("@" + u.get("username")) if u.get("username") else str(u.get("user_id")))
+        label_raw = u.get("name") or (("@" + u.get("username")) if u.get("username") else str(u.get("user_id")))
+        label = html.escape(label_raw)
 
         avg7 = u.get("avg_7d")
         c7 = u.get("count_7d", 0)
@@ -156,11 +155,11 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         c30 = u.get("count_30d", 0)
         a30 = u.get("anxiety_30d", 0)
 
-        avg7_s = f"{avg7:.2f}" if isinstance(avg7, (int, float)) else "—"
-        avg30_s = f"{avg30:.2f}" if isinstance(avg30, (int, float)) else "—"
+        avg7_s = f"{avg7:.1f}" if isinstance(avg7, (int, float)) else "—"
+        avg30_s = f"{avg30:.1f}" if isinstance(avg30, (int, float)) else "—"
 
         parts.append(
-            f"\n{label}\n\n"
+            f"\n<b>{label}</b>\n\n"
             f"7 дней\n"
             f"Средняя оценка: {avg7_s}\n"
             f"Количество успешных покаков: {c7}\n"
@@ -171,7 +170,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Пукательных тревог: {a30}"
         )
 
-    await update.message.reply_text("\n".join(parts))
+    await update.message.reply_text("\n".join(parts), parse_mode="HTML")
 
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -181,7 +180,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     current_chat_id = query.message.chat_id
 
     if data == "next":
-        await query.message.reply_text("Оцени покак:", reply_markup=keyboard_rate())
+        # Превращаем текущее сообщение обратно в “оценку”, без нового сообщения
+        await query.edit_message_text("Оцени покак:", reply_markup=keyboard_rate())
         return
 
     if data == "anxiety":
@@ -192,8 +192,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         res = await asyncio.to_thread(send)
         if res.get("ok"):
-            await query.edit_message_text("Записал: пукательная тревога ✅")
-            await query.message.reply_text("Оценить покак:", reply_markup=keyboard_next())
+            await query.edit_message_text("Записал: пукательная тревога ✅", reply_markup=keyboard_next())
             await notify_others(context, current_chat_id, "Случилась пукательная тревога!")
         else:
             if res.get("error") == "network":
@@ -215,8 +214,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         res = await asyncio.to_thread(send)
         if res.get("ok"):
-            await query.edit_message_text(f"Записал: {score}/10 ✅")
-            await query.message.reply_text("Оценить покак:", reply_markup=keyboard_next())
+            await query.edit_message_text(f"Записал: {score}/10 ✅", reply_markup=keyboard_next())
             await notify_others(context, current_chat_id, f"Кое-кто покакал! Оценка: {score}")
         else:
             if res.get("error") == "network":
