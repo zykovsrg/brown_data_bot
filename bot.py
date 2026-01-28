@@ -63,7 +63,6 @@ def keyboard_next() -> InlineKeyboardMarkup:
 
 
 def keyboard_react() -> InlineKeyboardMarkup:
-    # 5 строк, по одной кнопке
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💛 Радость", callback_data="react:joy")],
         [InlineKeyboardButton("🤍 Белая зависть", callback_data="react:white_envy")],
@@ -134,8 +133,22 @@ async def safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str)
             return
 
 
+async def safe_send_with_markup(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, reply_markup=None) -> None:
+    for attempt in range(4):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+            return
+        except RetryAfter as e:
+            await asyncio.sleep(float(getattr(e, "retry_after", 1.0)))
+        except (TimedOut, NetworkError) as e:
+            logging.warning("send_message network error: %s", e)
+            await _retry_sleep(attempt)
+        except Exception as e:
+            logging.exception("send_message with markup failed: %s", e)
+            return
+
+
 async def remove_reply_keyboard(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    # Убирает ReplyKeyboardMarkup (те две большие кнопки снизу)
     try:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -515,7 +528,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     current_chat_id = query.message.chat_id
 
     if data == "next":
-        await safe_edit_or_send(query, context, "Оцени покак:", reply_markup=keyboard_rate())
+        # ВАЖНО
+        # Не редактируем сообщение "Записал..."
+        # Просто отправляем новое сообщение с оценкой
+        await safe_send_with_markup(context, current_chat_id, "Оцени покак:", reply_markup=keyboard_rate())
         return
 
     if data.startswith("react:"):
