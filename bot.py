@@ -36,7 +36,7 @@ WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Sheet1")
 TZ = ZoneInfo("Europe/Moscow")
 ALARM_TEXT = "Привет! Коричневая тишина — это подозрительно. Не забудь добавить покаки!"
 
-DATA_DIR = "/app/data"
+DATA_DIR = "/data"
 QUEUE_PATH = os.path.join(DATA_DIR, "queue.jsonl")
 
 queue_lock = asyncio.Lock()
